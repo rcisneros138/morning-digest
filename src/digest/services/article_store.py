@@ -26,6 +26,11 @@ class ArticleStore:
         if await self._fingerprint_exists(source_id, parsed.fingerprint):
             return None
 
+        # Strip timezone info since DB column is TIMESTAMP WITHOUT TIME ZONE
+        published_at = parsed.published_at
+        if published_at is not None and published_at.tzinfo is not None:
+            published_at = published_at.replace(tzinfo=None)
+
         article = Article(
             source_id=source_id,
             title=parsed.title,
@@ -33,7 +38,7 @@ class ArticleStore:
             content_html=parsed.content_html,
             content_text=parsed.content_text,
             author=parsed.author,
-            published_at=parsed.published_at,
+            published_at=published_at,
             fingerprint=parsed.fingerprint,
         )
         self.db.add(article)

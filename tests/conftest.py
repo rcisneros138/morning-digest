@@ -1,21 +1,14 @@
-import asyncio
 from collections.abc import AsyncGenerator
 
 import pytest
+import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from digest.config import settings
 from digest.models import Base
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def engine():
     engine = create_async_engine(settings.database_url, echo=False)
     async with engine.begin() as conn:

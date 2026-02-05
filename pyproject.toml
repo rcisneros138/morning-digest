@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "psycopg2-binary>=2.9.11",
     "python-multipart>=0.0.22",
+    "litellm>=1.0.0",
 ]
 
 [project.optional-dependencies]

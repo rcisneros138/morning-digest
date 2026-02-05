@@ -18,6 +18,10 @@ celery_app.conf.beat_schedule = {
         "task": "digest.tasks.ingest.poll_all_rss_feeds",
         "schedule": crontab(minute="*/15"),
     },
+    "check-digest-schedule": {
+        "task": "digest.tasks.generate_digest.check_digest_schedule",
+        "schedule": crontab(minute="*"),
+    },
 }
 
 celery_app.autodiscover_tasks(["digest.tasks"])

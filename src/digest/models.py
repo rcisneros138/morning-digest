@@ -1,9 +1,20 @@
 import enum
 import hashlib
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Text, func
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -84,3 +95,60 @@ class Article(Base):
     def generate_fingerprint(title: str, content_text: str) -> str:
         normalized = f"{title.lower().strip()}:{content_text[:200].lower().strip()}"
         return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+class Digest(Base):
+    __tablename__ = "digests"
+    __table_args__ = (UniqueConstraint("user_id", "date", name="uq_digest_user_date"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    tier_at_creation: Mapped[UserTier] = mapped_column(Enum(UserTier), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    user: Mapped["User"] = relationship()
+    groups: Mapped[list["DigestGroup"]] = relationship(
+        back_populates="digest", order_by="DigestGroup.sort_order"
+    )
+
+
+class DigestGroup(Base):
+    __tablename__ = "digest_groups"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    digest_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("digests.id"), nullable=False)
+    topic_label: Mapped[str] = mapped_column(Text, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    digest: Mapped["Digest"] = relationship(back_populates="groups")
+    items: Mapped[list["DigestItem"]] = relationship(
+        back_populates="group", order_by="DigestItem.sort_order"
+    )
+
+
+class DigestItem(Base):
+    __tablename__ = "digest_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("digest_groups.id"), nullable=False)
+    article_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("articles.id"), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    group: Mapped["DigestGroup"] = relationship(back_populates="items")
+    article: Mapped["Article"] = relationship()
+
+
+class UserInteraction(Base):
+    __tablename__ = "user_interactions"
+    __table_args__ = (Index("ix_user_interactions_user_type", "user_id", "type"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    article_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("articles.id"), nullable=False)
+    type: Mapped[InteractionType] = mapped_column(Enum(InteractionType), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

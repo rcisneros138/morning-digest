@@ -10,6 +10,14 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_temperature: float = 0.2
     llm_timeout: int = 30
+    jwt_secret_key: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 30
+    jwt_refresh_token_expire_days: int = 30
+    mailgun_api_key: str = ""
+    mailgun_domain: str = ""
+    mailgun_from_email: str = "Morning Digest <digest@mg.example.com>"
+    admin_api_key: str = ""
 
     model_config = {"env_file": ".env"}
 

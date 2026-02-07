@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from digest.auth import get_current_user_id
 from digest.database import async_session
 from digest.models import InteractionType, UserInteraction
 from digest.services.digest_store import DigestStore
@@ -54,7 +55,6 @@ class DigestListItem(BaseModel):
 
 
 class InteractionRequest(BaseModel):
-    user_id: uuid.UUID
     article_id: uuid.UUID
     type: InteractionType
 
@@ -94,7 +94,7 @@ def _serialize_digest(digest) -> dict:
 
 
 @router.get("/latest")
-async def get_latest_digest(user_id: uuid.UUID = Query(...)):
+async def get_latest_digest(user_id: uuid.UUID = Depends(get_current_user_id)):
     async with async_session() as db:
         store = DigestStore(db)
         digest = await store.get_latest(user_id)
@@ -105,7 +105,7 @@ async def get_latest_digest(user_id: uuid.UUID = Query(...)):
 
 @router.get("/", response_model=list[DigestListItem])
 async def list_digests(
-    user_id: uuid.UUID = Query(...),
+    user_id: uuid.UUID = Depends(get_current_user_id),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
@@ -124,20 +124,28 @@ async def list_digests(
 
 
 @router.get("/{digest_id}")
-async def get_digest(digest_id: uuid.UUID):
+async def get_digest(
+    digest_id: uuid.UUID,
+    user_id: uuid.UUID = Depends(get_current_user_id),
+):
     async with async_session() as db:
         store = DigestStore(db)
         digest = await store.get_by_id(digest_id)
         if not digest:
             raise HTTPException(status_code=404, detail="Digest not found")
+        if digest.user_id != user_id:
+            raise HTTPException(status_code=404, detail="Digest not found")
         return _serialize_digest(digest)
 
 
 @router.post("/interactions", status_code=201)
-async def create_interaction(body: InteractionRequest):
+async def create_interaction(
+    body: InteractionRequest,
+    user_id: uuid.UUID = Depends(get_current_user_id),
+):
     async with async_session() as db:
         interaction = UserInteraction(
-            user_id=body.user_id,
+            user_id=user_id,
             article_id=body.article_id,
             type=body.type,
         )

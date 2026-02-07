@@ -7,6 +7,8 @@ from sqlalchemy import select
 
 from digest.database import async_session
 from digest.models import User
+from digest.services.digest_store import DigestStore
+from digest.services.email_sender import EmailSender
 from digest.services.llm import LLMService
 from digest.services.pipeline.orchestrator import Orchestrator
 from digest.worker import celery_app
@@ -55,6 +57,14 @@ async def _generate_for_user(user_id_str: str):
         if digest:
             await db.commit()
             logger.info("Generated digest %s for user %s", digest.id, user_id_str)
+
+            try:
+                store = DigestStore(db)
+                full_digest = await store.get_by_id(digest.id)
+                if full_digest:
+                    await EmailSender().send_digest(user, full_digest)
+            except Exception:
+                logger.exception("Email sending failed for digest %s", digest.id)
         else:
             logger.info("No articles to curate for user %s", user_id_str)
 

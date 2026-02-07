@@ -21,6 +21,9 @@ dependencies = [
     "psycopg2-binary>=2.9.11",
     "python-multipart>=0.0.22",
     "litellm>=1.0.0",
+    "PyJWT>=2.8.0",
+    "bcrypt>=4.0.0",
+    "email-validator>=2.0.0",
 ]
 
 [project.optional-dependencies]

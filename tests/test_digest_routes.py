@@ -7,6 +7,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from digest.app import create_app
+from digest.auth import get_current_user_id
 from digest.models import (
     Article,
     Digest,
@@ -26,10 +27,12 @@ def app():
 
 
 @pytest.fixture
-async def client(app):
+async def client(app, user):
+    app.dependency_overrides[get_current_user_id] = lambda: user.id
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -102,10 +105,7 @@ class TestGetLatestDigest:
             yield db
 
         with patch("digest.routes.digests.async_session", mock_session):
-            response = await client.get(
-                "/digests/latest",
-                params={"user_id": str(digest_with_data.user_id)},
-            )
+            response = await client.get("/digests/latest")
 
         assert response.status_code == 200
         data = response.json()
@@ -123,10 +123,7 @@ class TestGetLatestDigest:
             yield db
 
         with patch("digest.routes.digests.async_session", mock_session):
-            response = await client.get(
-                "/digests/latest",
-                params={"user_id": str(user.id)},
-            )
+            response = await client.get("/digests/latest")
 
         assert response.status_code == 404
 
@@ -154,6 +151,21 @@ class TestGetDigestById:
 
         assert response.status_code == 404
 
+    async def test_returns_404_for_other_users_digest(self, app, db, digest_with_data):
+        other_user_id = uuid.uuid4()
+        app.dependency_overrides[get_current_user_id] = lambda: other_user_id
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as other_client:
+
+            @asynccontextmanager
+            async def mock_session():
+                yield db
+
+            with patch("digest.routes.digests.async_session", mock_session):
+                response = await other_client.get(f"/digests/{digest_with_data.id}")
+
+        assert response.status_code == 404
+
 
 class TestListDigests:
     async def test_returns_digest_list(self, client, db, digest_with_data):
@@ -162,10 +174,7 @@ class TestListDigests:
             yield db
 
         with patch("digest.routes.digests.async_session", mock_session):
-            response = await client.get(
-                "/digests/",
-                params={"user_id": str(digest_with_data.user_id)},
-            )
+            response = await client.get("/digests/")
 
         assert response.status_code == 200
         data = response.json()
@@ -178,10 +187,7 @@ class TestListDigests:
             yield db
 
         with patch("digest.routes.digests.async_session", mock_session):
-            response = await client.get(
-                "/digests/",
-                params={"user_id": str(user.id)},
-            )
+            response = await client.get("/digests/")
 
         assert response.status_code == 200
         assert response.json() == []
@@ -199,7 +205,6 @@ class TestCreateInteraction:
             response = await client.post(
                 "/digests/interactions",
                 json={
-                    "user_id": str(user.id),
                     "article_id": str(article.id),
                     "type": "saved",
                 },

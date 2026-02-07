@@ -10,6 +10,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from digest.config import settings
+from digest.models import User
 
 bearer_scheme = HTTPBearer()
 
@@ -61,6 +62,35 @@ def decode_token(token: str, expected_type: str = "access") -> uuid.UUID:
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _password_fingerprint(password_hash: str) -> str:
+    return hashlib.sha256(password_hash.encode()).hexdigest()[:16]
+
+
+def create_password_reset_token(user: User) -> str:
+    expires = datetime.now(UTC) + timedelta(minutes=settings.password_reset_expire_minutes)
+    payload = {
+        "sub": str(user.id),
+        "exp": expires,
+        "type": "password_reset",
+        "pfp": _password_fingerprint(user.password_hash),
+    }
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+
+def decode_password_reset_token(token: str) -> tuple[uuid.UUID, str]:
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reset token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid reset token")
+
+    if payload.get("type") != "password_reset":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token type")
+
+    return uuid.UUID(payload["sub"]), payload["pfp"]
 
 
 async def get_current_user_id(

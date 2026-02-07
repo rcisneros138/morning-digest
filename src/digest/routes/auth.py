@@ -25,6 +25,15 @@ class LogoutRequest(BaseModel):
     refresh_token: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
 @router.post("/register", status_code=201)
 async def register(body: RegisterRequest):
     async with async_session() as db:
@@ -51,3 +60,17 @@ async def logout(body: LogoutRequest):
     async with async_session() as db:
         svc = AuthService(db)
         return await svc.logout(body.refresh_token)
+
+
+@router.post("/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest):
+    async with async_session() as db:
+        svc = AuthService(db)
+        return await svc.forgot_password(body.email)
+
+
+@router.post("/reset-password")
+async def reset_password(body: ResetPasswordRequest):
+    async with async_session() as db:
+        svc = AuthService(db)
+        return await svc.reset_password(body.token, body.new_password)

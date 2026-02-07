@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     mailgun_api_key: str = ""
     mailgun_domain: str = ""
     mailgun_from_email: str = "Morning Digest <digest@mg.example.com>"
+    password_reset_expire_minutes: int = 60
     admin_api_key: str = ""
 
     model_config = {"env_file": ".env"}

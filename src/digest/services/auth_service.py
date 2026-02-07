@@ -8,14 +8,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from digest.auth import (
+    _password_fingerprint,
     create_access_token,
+    create_password_reset_token,
     create_refresh_token,
+    decode_password_reset_token,
     decode_token,
     hash_password,
     hash_token,
     verify_password,
 )
 from digest.models import RefreshToken, User
+from digest.services.email_sender import EmailSender
 
 
 class AuthService:
@@ -120,4 +124,30 @@ class AuthService:
             stored.revoked_at = datetime.now(UTC).replace(tzinfo=None)
             await self.db.commit()
 
+        return {"status": "ok"}
+
+    async def forgot_password(self, email: str) -> dict:
+        user = await self.db.scalar(select(User).where(User.email == email))
+        if user:
+            token = create_password_reset_token(user)
+            sender = EmailSender()
+            await sender.send_password_reset(user, token)
+        return {"status": "ok"}
+
+    async def reset_password(self, token: str, new_password: str) -> dict:
+        user_id, pfp = decode_password_reset_token(token)
+        user = await self.db.get(User, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid reset token"
+            )
+
+        if _password_fingerprint(user.password_hash) != pfp:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reset token already used",
+            )
+
+        user.password_hash = hash_password(new_password)
+        await self.db.commit()
         return {"status": "ok"}

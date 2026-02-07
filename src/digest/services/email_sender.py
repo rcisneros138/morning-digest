@@ -41,6 +41,48 @@ class EmailSender:
             logger.exception("Failed to send digest email to %s", user.email)
             return False
 
+    async def send_password_reset(self, user: User, token: str) -> bool:
+        if not settings.mailgun_api_key or not settings.mailgun_domain:
+            logger.warning("Mailgun not configured, skipping password reset email for user %s", user.id)
+            return False
+
+        html = (
+            "<!DOCTYPE html>"
+            "<html><body style='font-family:sans-serif;max-width:600px;margin:0 auto;padding:16px;'>"
+            "<h1 style='color:#222;font-size:22px;'>Password Reset</h1>"
+            "<p>Use the following token to reset your password. It expires in 1 hour.</p>"
+            f"<p style='font-family:monospace;background:#f5f5f5;padding:12px;border-radius:4px;word-break:break-all;'>{token}</p>"
+            "<p style='color:#999;font-size:12px;'>If you didn't request this, you can safely ignore this email.</p>"
+            "</body></html>"
+        )
+        text = (
+            "Password Reset\n\n"
+            "Use the following token to reset your password. It expires in 1 hour.\n\n"
+            f"{token}\n\n"
+            "If you didn't request this, you can safely ignore this email."
+        )
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"https://api.mailgun.net/v3/{settings.mailgun_domain}/messages",
+                    auth=("api", settings.mailgun_api_key),
+                    data={
+                        "from": settings.mailgun_from_email,
+                        "to": user.email,
+                        "subject": "Password Reset - Morning Digest",
+                        "html": html,
+                        "text": text,
+                    },
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                logger.info("Sent password reset email to %s", user.email)
+                return True
+        except Exception:
+            logger.exception("Failed to send password reset email to %s", user.email)
+            return False
+
     def _render_html(self, digest: Digest) -> str:
         groups_html = ""
         for group in digest.groups:

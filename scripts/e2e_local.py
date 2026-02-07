@@ -38,6 +38,7 @@ from digest.tasks.ingest import ingest_rss_source
 
 E2E_EMAIL = "e2e-test@example.com"
 E2E_PASSWORD = "e2e-test-password-123"
+E2E_NEW_PASSWORD = "e2e-reset-password-456"
 
 SOURCES = [
     {
@@ -298,11 +299,99 @@ async def verify_token_lifecycle(client, refresh_token: str):
     return new_access
 
 
-async def verify_login(client):
-    """Test login with existing credentials."""
+async def update_user_settings(client, token: str):
+    """Update user timezone and digest_time via the API."""
+    headers = auth_headers(token)
+
+    # Get current settings
+    r = await client.get("/users/me", headers=headers)
+    assert r.status_code == 200, f"GET /users/me returned {r.status_code}: {r.text}"
+    data = r.json()
+    assert data["timezone"] == "UTC"
+    print(f"  GET  /users/me           -> 200 (timezone={data['timezone']})")
+
+    # Update timezone
+    r = await client.patch(
+        "/users/me",
+        json={"timezone": "America/New_York", "digest_time": "07:30"},
+        headers=headers,
+    )
+    assert r.status_code == 200, f"PATCH /users/me returned {r.status_code}: {r.text}"
+    data = r.json()
+    assert data["timezone"] == "America/New_York"
+    assert data["digest_time"] == "07:30"
+    print(f"  PATCH /users/me          -> 200 (timezone=America/New_York, digest_time=07:30)")
+
+    # Verify invalid timezone is rejected
+    r = await client.patch(
+        "/users/me",
+        json={"timezone": "Not/Real"},
+        headers=headers,
+    )
+    assert r.status_code == 422, f"Invalid timezone should return 422, got {r.status_code}"
+    print(f"  PATCH /users/me (bad tz) -> 422 (correct)")
+
+
+async def password_reset_flow(client):
+    """Test forgot-password -> reset-password -> login with new password."""
+    # Step 1: Request password reset
+    r = await client.post(
+        "/auth/forgot-password",
+        json={"email": E2E_EMAIL},
+    )
+    assert r.status_code == 200, f"/auth/forgot-password returned {r.status_code}: {r.text}"
+    print(f"  POST /auth/forgot-password -> 200")
+
+    # Step 2: To actually test reset, we need the token.
+    # In a real flow the user gets it via email. For e2e, generate it directly.
+    from digest.auth import create_password_reset_token
+
+    from digest.database import async_session as _session
+
+    async with _session() as db:
+        from sqlalchemy import select as _select
+
+        user = await db.scalar(_select(User).where(User.email == E2E_EMAIL))
+        reset_token = create_password_reset_token(user)
+
+    # Step 3: Reset password
+    r = await client.post(
+        "/auth/reset-password",
+        json={"token": reset_token, "new_password": E2E_NEW_PASSWORD},
+    )
+    assert r.status_code == 200, f"/auth/reset-password returned {r.status_code}: {r.text}"
+    print(f"  POST /auth/reset-password  -> 200")
+
+    # Step 4: Same token should be rejected (single use)
+    r = await client.post(
+        "/auth/reset-password",
+        json={"token": reset_token, "new_password": "another"},
+    )
+    assert r.status_code == 400, f"Reused reset token should return 400, got {r.status_code}"
+    print(f"  POST /auth/reset-password (reuse) -> 400 (correct)")
+
+    # Step 5: Login with new password
+    r = await client.post(
+        "/auth/login",
+        json={"email": E2E_EMAIL, "password": E2E_NEW_PASSWORD},
+    )
+    assert r.status_code == 200, f"Login with new password failed: {r.status_code}: {r.text}"
+    print(f"  POST /auth/login (new pw)  -> 200")
+
+    # Step 6: Old password should not work
     r = await client.post(
         "/auth/login",
         json={"email": E2E_EMAIL, "password": E2E_PASSWORD},
+    )
+    assert r.status_code == 401, f"Old password should fail, got {r.status_code}"
+    print(f"  POST /auth/login (old pw)  -> 401 (correct)")
+
+
+async def verify_login(client):
+    """Test login with existing credentials (uses new password after reset)."""
+    r = await client.post(
+        "/auth/login",
+        json={"email": E2E_EMAIL, "password": E2E_NEW_PASSWORD},
     )
     assert r.status_code == 200, f"/auth/login returned {r.status_code}: {r.text}"
     data = r.json()
@@ -348,31 +437,37 @@ async def main():
             step(4, "Add sources via API")
             await add_sources(client, access_token)
 
-        # Step 5-6: Ingest and generate (direct async, need DB)
+            step(5, "Update user settings")
+            await update_user_settings(client, access_token)
+
+        # Step 6-7: Ingest and generate (direct async, need DB)
         async with async_session() as db:
-            step(5, "Ingest RSS feeds (live network)")
+            step(6, "Ingest RSS feeds (live network)")
             await ingest(db, user_id)
 
-            step(6, "Generate digest (free tier, TF-IDF)")
+            step(7, "Generate digest (free tier, TF-IDF)")
             digest = await generate(db, user_id)
 
-            # Step 7: Verify DB
-            step(7, "Verify digest via database")
+            # Step 8: Verify DB
+            step(8, "Verify digest via database")
             await verify_db(db, digest)
             digest_id = str(digest.id)
 
-        # Step 8-10: Verify API with auth (new app instance for fresh sessions)
+        # Step 9-12: Verify API with auth (new app instance for fresh sessions)
         app = create_app()
         transport = httpx.ASGITransport(app=app)
 
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            step(8, "Verify digest API (authenticated)")
+            step(9, "Verify digest API (authenticated)")
             await verify_api(client, access_token, digest_id)
 
-            step(9, "Verify token refresh + logout lifecycle")
+            step(10, "Verify token refresh + logout lifecycle")
             await verify_token_lifecycle(client, refresh_token)
 
-            step(10, "Verify login with existing credentials")
+            step(11, "Password reset flow")
+            await password_reset_flow(client)
+
+            step(12, "Verify login with new credentials")
             await verify_login(client)
 
         print(f"\n{'='*60}")

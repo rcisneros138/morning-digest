@@ -1,10 +1,12 @@
 """Local end-to-end test for the morning-digest pipeline.
 
-Exercises the full flow against real RSS feeds, real PostgreSQL, and the HTTP API.
+Exercises the full user journey: register, add sources, ingest, generate digest,
+verify via authenticated API, refresh tokens, logout.
 No Celery worker needed — calls async functions directly.
 
 Prerequisites:
     docker compose up -d   (PostgreSQL + Redis)
+    JWT_SECRET_KEY set in .env (any string works for testing)
 
 Usage:
     uv run python scripts/e2e_local.py
@@ -19,32 +21,32 @@ import httpx
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
-from digest.app import create_app
 from digest.database import async_session
 from digest.models import (
     Article,
     Digest,
     DigestGroup,
     DigestItem,
+    RefreshToken,
     Source,
     SourceType,
     User,
     UserInteraction,
-    UserTier,
 )
 from digest.services.pipeline.orchestrator import Orchestrator
 from digest.tasks.ingest import ingest_rss_source
 
-E2E_EMAIL = "e2e-test@morning-digest.local"
+E2E_EMAIL = "e2e-test@example.com"
+E2E_PASSWORD = "e2e-test-password-123"
 
 SOURCES = [
     {
-        "type": SourceType.rss,
+        "type": "rss",
         "name": "Hacker News Front Page",
         "config": {"url": "https://hnrss.org/frontpage?count=5"},
     },
     {
-        "type": SourceType.rss,
+        "type": "rss",
         "name": "Hacker News Newest",
         "config": {"url": "https://hnrss.org/newest?count=5"},
     },
@@ -108,6 +110,7 @@ async def cleanup(db):
         await db.execute(delete(Digest).where(Digest.user_id == user.id))
 
     await db.execute(delete(UserInteraction).where(UserInteraction.user_id == user.id))
+    await db.execute(delete(RefreshToken).where(RefreshToken.user_id == user.id))
 
     if article_ids:
         await db.execute(delete(Article).where(Article.id.in_(article_ids)))
@@ -119,35 +122,56 @@ async def cleanup(db):
     print(f"  Cleaned up previous data for {E2E_EMAIL}")
 
 
-async def seed(db):
-    """Create test user and sources. Returns (user, sources)."""
-    user = User(email=E2E_EMAIL, password_hash="not-a-real-hash", tier=UserTier.free)
-    db.add(user)
-    await db.flush()
+def auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
-    sources = []
+
+async def register(client) -> dict:
+    """Register a new user via the API. Returns auth response."""
+    r = await client.post(
+        "/auth/register",
+        json={"email": E2E_EMAIL, "password": E2E_PASSWORD},
+    )
+    assert r.status_code == 201, f"/auth/register returned {r.status_code}: {r.text}"
+    data = r.json()
+    assert "user_id" in data
+    assert "access_token" in data
+    assert "refresh_token" in data
+    print(f"  POST /auth/register      -> 201")
+    print(f"  User ID: {data['user_id']}")
+    return data
+
+
+async def add_sources(client, token: str) -> list[dict]:
+    """Add sources via the API. Returns list of created sources."""
+    created = []
     for s in SOURCES:
-        source = Source(
-            user_id=user.id,
-            type=s["type"],
-            name=s["name"],
-            config=s["config"],
+        r = await client.post(
+            "/sources/",
+            json=s,
+            headers=auth_headers(token),
         )
-        db.add(source)
-        sources.append(source)
+        assert r.status_code == 201, f"POST /sources/ returned {r.status_code}: {r.text}"
+        source = r.json()
+        created.append(source)
+        print(f"  POST /sources/           -> 201 ({source['name']})")
 
-    await db.flush()
-    await db.commit()
+    # Verify list
+    r = await client.get("/sources/", headers=auth_headers(token))
+    assert r.status_code == 200
+    sources = r.json()
+    assert len(sources) == len(SOURCES), f"Expected {len(SOURCES)} sources, got {len(sources)}"
+    print(f"  GET  /sources/           -> 200 ({len(sources)} sources)")
 
-    print(f"  User:    {user.id} ({user.email}, tier={user.tier.value})")
-    for s in sources:
-        print(f"  Source:  {s.id} ({s.name})")
-
-    return user, sources
+    return created
 
 
-async def ingest(db, sources):
+async def ingest(db, user_id):
     """Fetch real RSS feeds and store articles."""
+    sources = (
+        await db.scalars(select(Source).where(Source.user_id == user_id))
+    ).all()
+
     total = 0
     for source in sources:
         count = await ingest_rss_source(db, source)
@@ -160,8 +184,9 @@ async def ingest(db, sources):
     return total
 
 
-async def generate(db, user):
+async def generate(db, user_id):
     """Run the full curation pipeline."""
+    user = await db.get(User, user_id)
     orch = Orchestrator()  # No LLM = free tier path
     digest = await orch.generate(db, user.id, user.tier)
     if digest is None:
@@ -205,40 +230,89 @@ async def verify_db(db, digest):
     return loaded
 
 
-async def verify_api(user_id, digest_id):
-    """Verify digest endpoints via the FastAPI app."""
-    app = create_app()
-    transport = httpx.ASGITransport(app=app)
+async def verify_api(client, token: str, digest_id: str):
+    """Verify digest endpoints with JWT auth."""
+    headers = auth_headers(token)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Health check
-        r = await client.get("/health")
-        assert r.status_code == 200, f"/health returned {r.status_code}"
-        print("  GET /health              -> 200 OK")
+    # Health check (no auth needed)
+    r = await client.get("/health")
+    assert r.status_code == 200, f"/health returned {r.status_code}"
+    print("  GET /health              -> 200 OK")
 
-        # Latest digest
-        r = await client.get("/digests/latest", params={"user_id": str(user_id)})
-        assert r.status_code == 200, f"/digests/latest returned {r.status_code}"
-        body = r.json()
-        assert len(body["groups"]) >= 1, "API returned digest with no groups"
-        print(f"  GET /digests/latest      -> 200 ({len(body['groups'])} groups)")
+    # Latest digest
+    r = await client.get("/digests/latest", headers=headers)
+    assert r.status_code == 200, f"/digests/latest returned {r.status_code}: {r.text}"
+    body = r.json()
+    assert len(body["groups"]) >= 1, "API returned digest with no groups"
+    print(f"  GET /digests/latest      -> 200 ({len(body['groups'])} groups)")
 
-        # Get by ID
-        r = await client.get(f"/digests/{digest_id}")
-        assert r.status_code == 200, f"/digests/{{id}} returned {r.status_code}"
-        print(f"  GET /digests/{{id}}        -> 200")
+    # Get by ID
+    r = await client.get(f"/digests/{digest_id}", headers=headers)
+    assert r.status_code == 200, f"/digests/{{id}} returned {r.status_code}: {r.text}"
+    print(f"  GET /digests/{{id}}        -> 200")
 
-        # List digests
-        r = await client.get("/digests/", params={"user_id": str(user_id)})
-        assert r.status_code == 200, f"/digests/ returned {r.status_code}"
-        items = r.json()
-        assert len(items) >= 1, "Digest list is empty"
-        print(f"  GET /digests/            -> 200 ({len(items)} digest(s))")
+    # List digests
+    r = await client.get("/digests/", headers=headers)
+    assert r.status_code == 200, f"/digests/ returned {r.status_code}: {r.text}"
+    items = r.json()
+    assert len(items) >= 1, "Digest list is empty"
+    print(f"  GET /digests/            -> 200 ({len(items)} digest(s))")
+
+    # Unauthenticated request should fail
+    r = await client.get("/digests/latest")
+    assert r.status_code in (401, 403), f"Expected 401/403 without auth, got {r.status_code}"
+    print(f"  GET /digests/latest (no auth) -> {r.status_code} (correct)")
+
+
+async def verify_token_lifecycle(client, refresh_token: str):
+    """Test refresh token rotation and logout."""
+    # Refresh
+    r = await client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    assert r.status_code == 200, f"/auth/refresh returned {r.status_code}: {r.text}"
+    data = r.json()
+    new_access = data["access_token"]
+    new_refresh = data["refresh_token"]
+    assert new_refresh != refresh_token, "Refresh token was not rotated"
+    print(f"  POST /auth/refresh       -> 200 (token rotated)")
+
+    # Old refresh token should be rejected
+    r = await client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    assert r.status_code == 401, f"Old refresh token should be rejected, got {r.status_code}"
+    print(f"  POST /auth/refresh (old) -> 401 (correct)")
+
+    # New access token should work
+    r = await client.get("/digests/latest", headers=auth_headers(new_access))
+    assert r.status_code in (200, 404), f"New access token failed: {r.status_code}"
+    print(f"  GET /digests/latest (new token) -> {r.status_code} (valid)")
+
+    # Logout
+    r = await client.post("/auth/logout", json={"refresh_token": new_refresh})
+    assert r.status_code == 200, f"/auth/logout returned {r.status_code}: {r.text}"
+    print(f"  POST /auth/logout        -> 200")
+
+    # Refresh after logout should fail
+    r = await client.post("/auth/refresh", json={"refresh_token": new_refresh})
+    assert r.status_code == 401, f"Post-logout refresh should fail, got {r.status_code}"
+    print(f"  POST /auth/refresh (post-logout) -> 401 (correct)")
+
+    return new_access
+
+
+async def verify_login(client):
+    """Test login with existing credentials."""
+    r = await client.post(
+        "/auth/login",
+        json={"email": E2E_EMAIL, "password": E2E_PASSWORD},
+    )
+    assert r.status_code == 200, f"/auth/login returned {r.status_code}: {r.text}"
+    data = r.json()
+    assert "access_token" in data
+    print(f"  POST /auth/login         -> 200")
+    return data
 
 
 async def main():
     failed = False
-    user = None
 
     try:
         # Step 1: Migrations
@@ -258,25 +332,48 @@ async def main():
             step(2, "Clean up previous test data")
             await cleanup(db)
 
-            # Step 3: Seed
-            step(3, "Seed test user and sources")
-            user, sources = await seed(db)
+        # Step 3-4: Register and add sources via API
+        from digest.app import create_app
 
-            # Step 4: Ingest
-            step(4, "Ingest RSS feeds (live network)")
-            await ingest(db, sources)
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
 
-            # Step 5: Generate digest
-            step(5, "Generate digest (free tier, TF-IDF)")
-            digest = await generate(db, user)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            step(3, "Register user via API")
+            auth_data = await register(client)
+            user_id = auth_data["user_id"]
+            access_token = auth_data["access_token"]
+            refresh_token = auth_data["refresh_token"]
 
-            # Step 6: Verify DB
-            step(6, "Verify digest via database")
+            step(4, "Add sources via API")
+            await add_sources(client, access_token)
+
+        # Step 5-6: Ingest and generate (direct async, need DB)
+        async with async_session() as db:
+            step(5, "Ingest RSS feeds (live network)")
+            await ingest(db, user_id)
+
+            step(6, "Generate digest (free tier, TF-IDF)")
+            digest = await generate(db, user_id)
+
+            # Step 7: Verify DB
+            step(7, "Verify digest via database")
             await verify_db(db, digest)
+            digest_id = str(digest.id)
 
-        # Step 7: Verify API (uses its own sessions)
-        step(7, "Verify digest via HTTP API")
-        await verify_api(user.id, digest.id)
+        # Step 8-10: Verify API with auth (new app instance for fresh sessions)
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            step(8, "Verify digest API (authenticated)")
+            await verify_api(client, access_token, digest_id)
+
+            step(9, "Verify token refresh + logout lifecycle")
+            await verify_token_lifecycle(client, refresh_token)
+
+            step(10, "Verify login with existing credentials")
+            await verify_login(client)
 
         print(f"\n{'='*60}")
         print("  E2E TEST PASSED")
